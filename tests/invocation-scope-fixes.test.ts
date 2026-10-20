@@ -118,6 +118,9 @@ function buildCtx(overrides: Record<string, unknown> = {}) {
       list: vi.fn(async () => {
         throw new Error(PROACTIVE_WILDCARD_DENIED);
       }),
+      // A single-company read IS allowed inside that company's own invocation,
+      // which is where the issue-prefix lookup runs.
+      get: vi.fn(async (companyId: string) => ({ id: companyId, name: "Acme", issuePrefix: "ACME" })),
     },
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: {

@@ -28,7 +28,9 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   humanizePriority,
+  buildLinkBaseUrl,
 } from "./formatters.js";
+import { resolveCompanyIssuePrefix } from "./company-prefix.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -253,7 +255,14 @@ type DiscordRuntime = {
   token: string;
   tokenSecretId: string;
   paperclipBoardApiKey: string;
+  /** API base URL. Carries `/api/...` calls, so it never gets a company prefix. */
   baseUrl: string;
+  /**
+   * `baseUrl` plus the company's issue prefix — the base for dashboard deep
+   * links only. Falls back to `baseUrl` when the prefix cannot be resolved.
+   * See `buildLinkBaseUrl` in formatters.ts.
+   */
+  linkBaseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
   gateway: GatewayHandle | null;
@@ -653,7 +662,8 @@ async function notify(
   );
   if (!channelId) return;
 
-  const message = formatter(event, rt.baseUrl);
+  // Link base, not API base: these formatters only build dashboard deep links.
+  const message = formatter(event, rt.linkBaseUrl || rt.baseUrl);
   const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
 
   if (messageId) {
@@ -1307,6 +1317,14 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
+  // Resolved here, once per bootstrap, because this is a company-scoped
+  // invocation — the host denies `ctx.companies.get` on the proactive
+  // invocations that carry gateway traffic. Never throws; an unresolved prefix
+  // leaves deep links in their previous prefix-less form.
+  rt.linkBaseUrl = buildLinkBaseUrl(
+    baseUrl,
+    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
+  );
   rt.cmdCtx = {
     baseUrl,
     companyId,

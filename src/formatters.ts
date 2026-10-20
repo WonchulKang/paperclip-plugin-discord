@@ -31,6 +31,30 @@ export function humanizePriority(raw: string): string {
   return PRIORITY_LABELS[raw] ?? raw;
 }
 
+/**
+ * Build the base URL for dashboard DEEP LINKS (the `url` of a link button).
+ *
+ * The web app namespaces every entity route under the company's issue prefix
+ * (`/:companyPrefix/issues/:id`, `/:companyPrefix/approvals/:id`). A link built
+ * from the API base URL alone makes the app read the first path segment —
+ * `issues`, `approvals` — as a company prefix, and it fails with
+ * "Organization not found — No organization matches prefix \"APPROVALS\"".
+ *
+ * This value is for links ONLY. The API base URL must stay un-prefixed: the
+ * same configured value carries every `${baseUrl}/api/...` call (approval
+ * decisions, reply-to-comment), and those 404 under a company prefix.
+ *
+ * `issuePrefix` is nullable on purpose — when the lookup fails the caller
+ * passes null and links degrade to their previous, prefix-less form instead of
+ * the notification failing.
+ */
+export function buildLinkBaseUrl(baseUrl: string | undefined, issuePrefix?: string | null): string {
+  const base = (baseUrl || DEFAULT_BASE_URL).trim().replace(/\/+$/, "");
+  const prefix = (issuePrefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!prefix) return base;
+  return `${base}/${encodeURIComponent(prefix)}`;
+}
+
 function resolveBaseUrl(baseUrl?: string): string | null {
   const url = (baseUrl || DEFAULT_BASE_URL).trim();
   const normalized = url.endsWith("/") ? url.slice(0, -1) : url;
