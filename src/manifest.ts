@@ -24,6 +24,11 @@ const manifest: PaperclipPluginManifestV1 = {
     "issue.comments.read",
     "issues.create",
     "issues.update",
+    // Approval cards post the approval's own payload (title, description, what
+    // the requester attached); `approval.created` carries none of it. Without
+    // this the worker falls back to `GET /api/approvals/{id}` with the board
+    // API key, which not every install configures.
+    "approvals.read",
     "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",

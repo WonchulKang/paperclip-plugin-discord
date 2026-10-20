@@ -31,6 +31,7 @@ import {
   buildLinkBaseUrl,
 } from "./formatters.js";
 import { resolveCompanyIssuePrefix } from "./company-prefix.js";
+import { fetchApprovalRecord } from "./approval-details.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -638,6 +639,100 @@ export async function enrichRunPayload(
       runId: typeof payload.runId === "string" ? payload.runId : event.entityId,
       agentId,
       issueId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return payload;
+}
+
+/** How many linked issues an approval card resolves before it stops looking. */
+const MAX_ENRICHED_LINKED_ISSUES = 5;
+
+/**
+ * Fill an `approval.created` payload with what a human needs to decide.
+ *
+ * The event is the host's activity-log entry, whose payload is
+ * `{ type, issueIds }` plus the log envelope. The requester's title,
+ * description and any extra context live on the approval row; the linked
+ * issues arrive as bare UUIDs. Both are resolved here so `formatApprovalCreated`
+ * stays a pure function of its payload.
+ *
+ * Enrichment is best-effort — a failed lookup costs the card some detail, and
+ * must never cost the board the notification.
+ */
+export async function enrichApprovalPayload(
+  ctx: PluginContext,
+  event: PluginEvent,
+  opts: { companyId?: string; baseUrl: string; apiKey?: string },
+): Promise<Record<string, unknown>> {
+  const payload = { ...(event.payload as Record<string, unknown>) };
+  const approvalId =
+    (typeof payload.approvalId === "string" && payload.approvalId) || event.entityId || "";
+  if (!approvalId) return payload;
+  payload.approvalId = approvalId;
+
+  const companyId =
+    (typeof event.companyId === "string" && event.companyId) || opts.companyId || "";
+
+  try {
+    const approval = await fetchApprovalRecord(
+      ctx,
+      approvalId,
+      companyId,
+      opts.baseUrl,
+      opts.apiKey,
+    );
+    if (approval) {
+      // The approval's own payload is what the requester wrote. The event
+      // payload wins on conflict — it is the record of what actually fired.
+      for (const [key, value] of Object.entries(approval.payload ?? {})) {
+        if (payload[key] == null) payload[key] = value;
+      }
+      if (payload.type == null && approval.type) payload.type = approval.type;
+      if (payload.agentId == null && approval.requestedByAgentId) {
+        payload.agentId = approval.requestedByAgentId;
+      }
+    }
+
+    const requesterAgentId =
+      (typeof payload.agentId === "string" && payload.agentId) ||
+      (typeof event.actorId === "string" && event.actorId) ||
+      null;
+    if (!payload.agentName && requesterAgentId && companyId) {
+      const agents = (await ctx.agents.list({ companyId })) as Array<{ id: string; name: string }>;
+      const match = agents.find((a) => a.id === requesterAgentId);
+      if (match?.name) payload.agentName = match.name;
+    }
+
+    if (!Array.isArray(payload.linkedIssues) && companyId) {
+      const issueIds = Array.isArray(payload.issueIds)
+        ? (payload.issueIds as unknown[]).filter((id): id is string => typeof id === "string")
+        : [];
+      const linked: Array<Record<string, unknown>> = [];
+      for (const issueId of issueIds.slice(0, MAX_ENRICHED_LINKED_ISSUES)) {
+        const issue = (await ctx.issues.get(issueId, companyId)) as {
+          id: string;
+          identifier?: string | null;
+          title?: string | null;
+          status?: string | null;
+          priority?: string | null;
+        } | null;
+        if (issue) {
+          linked.push({
+            id: issue.id,
+            identifier: issue.identifier ?? null,
+            title: issue.title ?? null,
+            status: issue.status ?? null,
+            priority: issue.priority ?? null,
+          });
+        }
+      }
+      if (linked.length > 0) payload.linkedIssues = linked;
+    }
+  } catch (error) {
+    ctx.logger.debug("Approval notification enrichment failed", {
+      approvalId,
       error: error instanceof Error ? error.message : String(error),
     });
   }
@@ -2085,10 +2180,15 @@ const plugin = definePlugin({
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const rt = await ensureRuntime(ctx, event.companyId);
       if (!rt || !rt.config.notifyOnApprovalCreated) return;
+      const payload = await enrichApprovalPayload(ctx, event, {
+        companyId: rt.companyId,
+        baseUrl: rt.baseUrl,
+        apiKey: rt.paperclipBoardApiKey,
+      });
       await notify(
         ctx,
         rt,
-        event,
+        { ...event, payload },
         formatApprovalCreated,
         rt.approvalsChannelId ?? undefined,
         rt.config.approvalsChannels,

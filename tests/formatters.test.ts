@@ -329,7 +329,7 @@ describe("agent label formatting", () => {
       makeEvent({ payload: { agentName: "DeployBot", type: "deploy" } }),
     );
     const fields = msg.embeds?.[0]?.fields ?? [];
-    const agentField = fields.find((f) => f.name === "Agent");
+    const agentField = fields.find((f) => f.name === "Requested by");
     expect(agentField?.value).toBe("DeployBot");
   });
 });
