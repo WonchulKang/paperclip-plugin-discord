@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   definePlugin,
   runWorker,
@@ -64,6 +65,26 @@ import {
   untrackPendingEscalation,
   collectPendingEscalationIds,
 } from "./escalation-state.js";
+import { readLegacyDefaultScopeState } from "./legacy-state.js";
+
+/**
+ * Async context as it exists at module load — before the host has registered
+ * any invocation.
+ *
+ * The gateway is connected from inside the `configChanged` RPC, and the SDK
+ * runs that handler inside the invocation's AsyncLocalStorage context. Without
+ * this snapshot the WebSocket and every one of its callbacks inherit that
+ * context, so once the RPC returns and the host clears the invocation, each
+ * callback echoes a dead invocation ID and the host rejects it:
+ *
+ *   Plugin "..." is not allowed to perform "agents.list": the worker
+ *   referenced a missing, expired, or unknown invocation scope
+ *
+ * Connecting inside the clean snapshot means callbacks carry no invocation ID,
+ * so the host authorizes them through its proactive path (the set of companies
+ * this plugin is configured for) instead.
+ */
+const CLEAN_ASYNC_CONTEXT = AsyncLocalStorage.snapshot();
 
 type DiscordConfig = {
   /**
@@ -908,11 +929,10 @@ async function ingestInbound(
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: "default",
-        stateKey: `escalation_${mapping.entityId}`,
-      }) as EscalationRecord | null;
+      record = await readLegacyDefaultScopeState(
+        ctx,
+        `escalation_${mapping.entityId}`,
+      ) as EscalationRecord | null;
     }
 
     // Two state reads happened above; nothing has been written yet.
@@ -1345,7 +1365,9 @@ async function bootstrapRuntime(
 
   if (!reuseGateway) {
     try {
-      rt.gateway = await connectGateway(
+      // Connect inside the clean snapshot so the socket's callbacks do not
+      // inherit this RPC's invocation scope — see CLEAN_ASYNC_CONTEXT.
+      rt.gateway = await CLEAN_ASYNC_CONTEXT(() => connectGateway(
         ctx,
         token,
         // Every callback reads the CURRENT runtime rather than closing over the
@@ -1385,7 +1407,7 @@ async function bootstrapRuntime(
             runtimeHealth = { status: "degraded", message, details };
           },
         },
-      );
+      ));
     } catch (err) {
       const error = summarizeError(err, [token]);
       rt.gatewayFailed = true;
