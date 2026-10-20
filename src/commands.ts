@@ -368,7 +368,7 @@ async function handleSlashCommand(
 ): Promise<unknown> {
   // Lazy company-ID resolution: resolve on first command, not at startup.
   const companyId = cmdCtx?.pluginCtx
-    ? await resolveCompanyId(cmdCtx.pluginCtx)
+    ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.companyId)
     : (cmdCtx?.companyId ?? "default");
 
   if (data.name === "acp") {
@@ -484,7 +484,7 @@ async function handleAutocomplete(
 
     if (focusedOption.name === "project") {
       const companyId = cmdCtx?.pluginCtx
-        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        ? await resolveCompanyId(cmdCtx.pluginCtx, cmdCtx.companyId)
         : (cmdCtx?.companyId ?? "default");
       const projects = await ctx.projects.list({ companyId, limit: 100 });
       const filtered = projects
@@ -1269,7 +1269,7 @@ async function handleButtonClick(
   }
 
   if (customId.startsWith("esc_")) {
-    return handleEscalationButton(ctx, customId, actor, base);
+    return handleEscalationButton(ctx, customId, actor, base, cmdCtx?.companyId);
   }
 
   if (customId.startsWith("handoff_")) {
@@ -1288,7 +1288,7 @@ async function handleButtonClick(
     const issueId = customId.replace("issue_reopen_", "");
     ctx.logger.info("Reopen button clicked", { issueId, actor });
     try {
-      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
+      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId, cmdCtx?.companyId);
       await ctx.issues.update(issueId, { status: "todo" }, issueCompanyId);
     } catch (err) {
       ctx.logger.error("Failed to reopen issue", { issueId, error: String(err) });
@@ -1313,7 +1313,7 @@ async function handleButtonClick(
     const issueId = customId.replace("issue_assign_", "");
     ctx.logger.info("Assign to Me button clicked", { issueId, actor });
     try {
-      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId);
+      const issueCompanyId = await resolveIssueCompanyId(ctx, issueId, cmdCtx?.companyId);
       const issue = await ctx.issues.get(issueId, issueCompanyId) as {
         assigneeUserId?: string | null;
         assigneeAgentId?: string | null;
@@ -1374,6 +1374,7 @@ async function handleEscalationButton(
   customId: string,
   actor: string,
   _baseUrl: string,
+  configuredCompanyId?: string,
 ): Promise<unknown> {
   // Button custom_id format: esc_{action}_{companyId}_{escalationId}
   // Legacy format (pre-fix): esc_{action}_{escalationId}
@@ -1392,7 +1393,7 @@ async function handleEscalationButton(
 
   ctx.logger.info("Escalation button clicked", { escalationId, action, actor, embeddedCompanyId });
 
-  const companyIdForLookup = embeddedCompanyId ?? await resolveCompanyId(ctx);
+  const companyIdForLookup = embeddedCompanyId ?? await resolveCompanyId(ctx, configuredCompanyId);
   const record = await getEscalation(ctx, escalationId, companyIdForLookup) as {
     escalationId: string; companyId: string; agentName: string;
     reason: string; suggestedReply?: string; status: string;
@@ -1512,12 +1513,38 @@ async function handleEscalationButton(
 async function resolveIssueCompanyId(
   ctx: PluginContext,
   issueId: string,
+  preferredCompanyId?: string,
 ): Promise<string> {
-  const companies = await ctx.companies.list();
-  for (const company of companies) {
-    const issue = await ctx.issues.get(issueId, company.id);
-    if (issue) return company.id;
+  // Try the configured company first. Button clicks arrive from the Discord
+  // gateway as proactive invocations, where the host refuses `companies.list()`
+  // outright, so a list-first lookup made every button fail with a permission
+  // error instead of "issue not found".
+  if (preferredCompanyId && preferredCompanyId !== "default") {
+    try {
+      const issue = await ctx.issues.get(issueId, preferredCompanyId);
+      if (issue) return preferredCompanyId;
+    } catch (err) {
+      ctx.logger.debug("Issue lookup in the configured company failed", {
+        issueId,
+        companyId: preferredCompanyId,
+        error: String(err),
+      });
+    }
   }
+
+  try {
+    const companies = await ctx.companies.list();
+    for (const company of companies) {
+      const issue = await ctx.issues.get(issueId, company.id);
+      if (issue) return company.id;
+    }
+  } catch (err) {
+    ctx.logger.debug("Company enumeration is unavailable on this invocation", {
+      issueId,
+      error: String(err),
+    });
+  }
+
   throw new Error(`Issue not found: ${issueId}`);
 }
 
@@ -1539,7 +1566,7 @@ async function handleCommands(
     });
   }
 
-  const companyId = await resolveCompanyId(ctx);
+  const companyId = await resolveCompanyId(ctx, cmdCtx?.companyId);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";
@@ -1815,7 +1842,7 @@ async function handleWorkflowApprovalButton(
 ): Promise<unknown> {
   const approved = customId.startsWith("wf_approve_");
   const approvalId = customId.replace(/^wf_(approve|reject)_/, "");
-  const companyId = await resolveCompanyId(ctx);
+  const companyId = await resolveCompanyId(ctx, cmdCtx?.companyId);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";

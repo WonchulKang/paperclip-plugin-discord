@@ -8,10 +8,21 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * `/clip connect`) before falling back to list-based resolution. The
  * connected company is NOT cached so that `/clip connect` changes take effect
  * immediately without restarting the plugin.
+ *
+ * `preferredCompanyId` is the company this worker was configured for. It is
+ * tried before `companies.list()` because the host refuses `companies.list()`
+ * on proactive invocations — a wildcard is deliberately never granted outside
+ * a company-scoped invocation, and everything arriving from the Discord
+ * gateway (slash commands, buttons, messages) is proactive. Without it the
+ * resolver always fell through to the literal string "default", which is not a
+ * real company ID, so every subsequent `{ companyId }` call was rejected.
  */
 let _cachedCompanyId: string | null = null;
 
-export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
+export async function resolveCompanyId(
+  ctx: PluginContext,
+  preferredCompanyId?: string,
+): Promise<string> {
   // Check if a guild-level default was set via /clip connect — always re-read
   // so that switching companies works without a plugin restart.
   try {
@@ -21,6 +32,12 @@ export async function resolveCompanyId(ctx: PluginContext): Promise<string> {
     }
   } catch {
     // state API unavailable at this call site — fall through to list-based resolution
+  }
+
+  // The configured company is authoritative for this worker and needs no API
+  // call, so it beats list-based resolution on every path that can supply it.
+  if (preferredCompanyId && preferredCompanyId !== "default") {
+    return preferredCompanyId;
   }
 
   if (_cachedCompanyId) return _cachedCompanyId;

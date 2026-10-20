@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   definePlugin,
   runWorker,
@@ -27,7 +28,9 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   humanizePriority,
+  buildLinkBaseUrl,
 } from "./formatters.js";
+import { resolveCompanyIssuePrefix } from "./company-prefix.js";
 import { handleInteraction, SLASH_COMMANDS, type CommandContext } from "./commands.js";
 import { runIntelligenceScan, runBackfill } from "./intelligence.js";
 import { connectGateway, type GatewayHandle, type MessageCreateEvent } from "./gateway.js";
@@ -64,6 +67,26 @@ import {
   untrackPendingEscalation,
   collectPendingEscalationIds,
 } from "./escalation-state.js";
+import { readLegacyDefaultScopeState } from "./legacy-state.js";
+
+/**
+ * Async context as it exists at module load — before the host has registered
+ * any invocation.
+ *
+ * The gateway is connected from inside the `configChanged` RPC, and the SDK
+ * runs that handler inside the invocation's AsyncLocalStorage context. Without
+ * this snapshot the WebSocket and every one of its callbacks inherit that
+ * context, so once the RPC returns and the host clears the invocation, each
+ * callback echoes a dead invocation ID and the host rejects it:
+ *
+ *   Plugin "..." is not allowed to perform "agents.list": the worker
+ *   referenced a missing, expired, or unknown invocation scope
+ *
+ * Connecting inside the clean snapshot means callbacks carry no invocation ID,
+ * so the host authorizes them through its proactive path (the set of companies
+ * this plugin is configured for) instead.
+ */
+const CLEAN_ASYNC_CONTEXT = AsyncLocalStorage.snapshot();
 
 type DiscordConfig = {
   /**
@@ -232,7 +255,14 @@ type DiscordRuntime = {
   token: string;
   tokenSecretId: string;
   paperclipBoardApiKey: string;
+  /** API base URL. Carries `/api/...` calls, so it never gets a company prefix. */
   baseUrl: string;
+  /**
+   * `baseUrl` plus the company's issue prefix — the base for dashboard deep
+   * links only. Falls back to `baseUrl` when the prefix cannot be resolved.
+   * See `buildLinkBaseUrl` in formatters.ts.
+   */
+  linkBaseUrl: string;
   cmdCtx: CommandContext;
   adapter: DiscordAdapter;
   gateway: GatewayHandle | null;
@@ -632,7 +662,8 @@ async function notify(
   );
   if (!channelId) return;
 
-  const message = formatter(event, rt.baseUrl);
+  // Link base, not API base: these formatters only build dashboard deep links.
+  const message = formatter(event, rt.linkBaseUrl || rt.baseUrl);
   const messageId = await postEmbedWithId(ctx, rt.token, channelId, message);
 
   if (messageId) {
@@ -908,11 +939,10 @@ async function ingestInbound(
     }) as EscalationRecord | null;
     // Backward-compat fallback: check "default" scope if company-scoped read returns null
     if (!record && escalationCompanyId !== "default") {
-      record = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: "default",
-        stateKey: `escalation_${mapping.entityId}`,
-      }) as EscalationRecord | null;
+      record = await readLegacyDefaultScopeState(
+        ctx,
+        `escalation_${mapping.entityId}`,
+      ) as EscalationRecord | null;
     }
 
     // Two state reads happened above; nothing has been written yet.
@@ -1287,6 +1317,14 @@ async function bootstrapRuntime(
   rt.tokenSecretId = normalizeSecretRefId(config.discordBotTokenRef) ?? "";
   rt.paperclipBoardApiKey = paperclipBoardApiKey;
   rt.baseUrl = baseUrl;
+  // Resolved here, once per bootstrap, because this is a company-scoped
+  // invocation — the host denies `ctx.companies.get` on the proactive
+  // invocations that carry gateway traffic. Never throws; an unresolved prefix
+  // leaves deep links in their previous prefix-less form.
+  rt.linkBaseUrl = buildLinkBaseUrl(
+    baseUrl,
+    await resolveCompanyIssuePrefix(ctx, companyId, baseUrl, paperclipBoardApiKey),
+  );
   rt.cmdCtx = {
     baseUrl,
     companyId,
@@ -1345,7 +1383,9 @@ async function bootstrapRuntime(
 
   if (!reuseGateway) {
     try {
-      rt.gateway = await connectGateway(
+      // Connect inside the clean snapshot so the socket's callbacks do not
+      // inherit this RPC's invocation scope — see CLEAN_ASYNC_CONTEXT.
+      rt.gateway = await CLEAN_ASYNC_CONTEXT(() => connectGateway(
         ctx,
         token,
         // Every callback reads the CURRENT runtime rather than closing over the
@@ -1385,7 +1425,7 @@ async function bootstrapRuntime(
             runtimeHealth = { status: "degraded", message, details };
           },
         },
-      );
+      ));
     } catch (err) {
       const error = summarizeError(err, [token]);
       rt.gatewayFailed = true;
