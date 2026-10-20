@@ -70,6 +70,43 @@ function resolveBaseUrl(baseUrl?: string): string | null {
   }
 }
 
+/**
+ * Payload keys `formatIssueCreated` already renders into a named field, the
+ * embed body, or a button — never repeat them in the catch-all loop below.
+ */
+const RENDERED_ISSUE_PAYLOAD_KEYS = new Set([
+  "identifier", "title", "description", "status", "priority",
+  "assigneeName", "projectName", "assigneeAgentId", "projectId",
+  "creatorName", "parentIdentifier", "parentTitle", "parentId",
+]);
+
+/**
+ * Bookkeeping keys that must stay off the card.
+ *
+ * The catch-all loop exists to surface genuinely custom payload fields, but
+ * `issue.created` is forwarded verbatim from the host's activity log, so its
+ * payload also carries the host's own scheduling and audit bookkeeping plus
+ * whatever the worker's enrichment pass added. Rendering those turned every
+ * card into a wall of `statusDefaulted: false` / `assignmentWakeSkipReason`
+ * / raw `runId` fields that no reader wants.
+ *
+ * Unknown keys still render — only this named set is suppressed, so a host
+ * that starts sending something meaningful keeps showing it.
+ */
+const INTERNAL_ISSUE_PAYLOAD_KEYS = new Set([
+  // Host activity-log envelope (services/activity-log.ts).
+  "agentId", "runId", "responsibleUserId",
+  // Host issue-create bookkeeping (routes/issues.ts).
+  "statusDefaulted", "statusDefaultReason",
+  "assignmentWakeSkipped", "assignmentWakeSkipReason",
+  "addedReferencedIssues", "removedReferencedIssues", "currentReferencedIssues",
+  "referencedIssueIdentifiers", "blockedByIssueIds", "watchdogDiscovery",
+  "originKind", "originId", "billingCode",
+  // Added by the worker's own enrichment pass, for other formatters' use.
+  "assigneeUserId", "agentName", "executorName", "completedBy", "lastComment",
+  "completedAt", "updatedAt",
+]);
+
 export function formatIssueCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? p.title ?? event.entityId);
@@ -96,13 +133,10 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
   if (assigneeName) fields.push({ name: "Assignee", value: assigneeName, inline: true });
   if (projectName) fields.push({ name: "Project", value: projectName, inline: true });
 
-  const knownKeys = new Set([
-    "identifier", "title", "description", "status", "priority",
-    "assigneeName", "projectName", "assigneeAgentId", "projectId",
-    "creatorName", "parentIdentifier", "parentTitle", "parentId",
-  ]);
   for (const [key, value] of Object.entries(p)) {
-    if (knownKeys.has(key) || value == null || value === "") continue;
+    if (RENDERED_ISSUE_PAYLOAD_KEYS.has(key)) continue;
+    if (INTERNAL_ISSUE_PAYLOAD_KEYS.has(key)) continue;
+    if (value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
     if (display.length > 0 && display.length <= 1024) {
       fields.push({ name: key, value: display, inline: display.length < 40 });

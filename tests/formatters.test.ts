@@ -71,6 +71,38 @@ describe("formatIssueCreated", () => {
     );
     expect(msg.embeds?.[0]?.title).toBe("Issue Created: Fix login bug");
   });
+
+  // The payload arrives verbatim from the host's activity log, so the catch-all
+  // field loop used to publish the host's scheduling bookkeeping and the
+  // worker's own enrichment leftovers as embed fields.
+  it("keeps host and worker bookkeeping off the card", () => {
+    const msg = formatIssueCreated(
+      makeEvent({
+        payload: {
+          identifier: "PROJ-42",
+          title: "Fix login bug",
+          statusDefaulted: false,
+          statusDefaultReason: "explicit",
+          assignmentWakeSkipped: true,
+          assignmentWakeSkipReason: "no_agent_assignee",
+          currentReferencedIssues: [{ id: "x", identifier: "PROJ-1", title: "Parent" }],
+          runId: "4cbb69ce-8509-43eb-bcd0-32a2e5a55b14",
+          responsibleUserId: "usr-1",
+          agentName: "SWTeamLeader",
+          updatedAt: "2026-03-15T12:00:00Z",
+        },
+      }),
+    );
+    expect(msg.embeds?.[0]?.fields?.map((f) => f.name)).toEqual([]);
+  });
+
+  it("still surfaces genuinely custom payload fields", () => {
+    const msg = formatIssueCreated(
+      makeEvent({ payload: { identifier: "PROJ-42", severity: "sev1" } }),
+    );
+    const custom = msg.embeds?.[0]?.fields?.find((f) => f.name === "severity");
+    expect(custom?.value).toBe("sev1");
+  });
 });
 
 describe("formatIssueDone", () => {

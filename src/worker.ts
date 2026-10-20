@@ -423,6 +423,50 @@ async function resolveChannel(
   return normalizeDiscordId(fallback);
 }
 
+/**
+ * Fill in the `parentId` / `parentIdentifier` / `parentTitle` the notification
+ * formatters need for the **Parent** field and the **View Parent** button.
+ *
+ * None of the three ever arrive on the event. `issue.created` and
+ * `issue.updated` are forwarded straight from the host's activity log, whose
+ * `details` object carries only title/identifier/status plus scheduling
+ * bookkeeping — the parent link is not in it, so `View Parent` never rendered
+ * for any issue, however deeply nested. Only an explicit lookup recovers it.
+ *
+ * Two lookups: one for the child's `parentId`, a second for the parent's
+ * identifier and title. The second one is best-effort and swallows its own
+ * failure — a parent we cannot name still produces a usable button, and a
+ * parent we cannot reach must not cost the caller the rest of its enrichment.
+ */
+async function enrichParentIssueFields(
+  ctx: PluginContext,
+  payload: IssueNotificationPayload,
+  parentId: string | null,
+  companyId: string,
+): Promise<void> {
+  if (payload.parentId == null && parentId) payload.parentId = parentId;
+
+  const resolvedParentId = typeof payload.parentId === "string" ? payload.parentId : null;
+  if (!resolvedParentId) return;
+  if (payload.parentIdentifier != null && payload.parentTitle != null) return;
+
+  try {
+    const parent = await ctx.issues.get(resolvedParentId, companyId) as {
+      id: string;
+      identifier?: string | null;
+      title?: string | null;
+    } | null;
+    if (!parent) return;
+    if (payload.parentIdentifier == null) payload.parentIdentifier = parent.identifier ?? parent.id;
+    if (payload.parentTitle == null) payload.parentTitle = parent.title;
+  } catch (error) {
+    ctx.logger.debug("Parent issue lookup failed; the notification keeps its unnamed parent link", {
+      parentId: resolvedParentId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function enrichIssueNotificationPayload(
   ctx: PluginContext,
   event: PluginEvent,
@@ -446,6 +490,7 @@ async function enrichIssueNotificationPayload(
       executionAgentNameKey?: string | null;
       completedAt?: Date | string | null;
       updatedAt?: Date | string | null;
+      parentId?: string | null;
       project?: { name?: string | null } | null;
     } | null;
 
@@ -469,6 +514,7 @@ async function enrichIssueNotificationPayload(
       if (payload.completedAt == null && issue.completedAt) payload.completedAt = String(issue.completedAt);
       if (payload.updatedAt == null && issue.updatedAt) payload.updatedAt = String(issue.updatedAt);
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
+      await enrichParentIssueFields(ctx, payload, issue.parentId ?? null, companyId);
     }
 
     if (String(payload.status ?? "") === "done") {
