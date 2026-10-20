@@ -272,8 +272,13 @@ function workerConfig(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function buildWorkerHost(options: { issuePrefix?: string | null; denyCompaniesGet?: boolean } = {}) {
-  const { issuePrefix = "SOO", denyCompaniesGet = false } = options;
+function buildWorkerHost(options: {
+  issuePrefix?: string | null;
+  denyCompaniesGet?: boolean;
+  /** Stands in for the host's `ctx.issues.get`; `null` means "no such issue". */
+  issuesById?: Record<string, Record<string, unknown> | Error>;
+} = {}) {
+  const { issuePrefix = "SOO", denyCompaniesGet = false, issuesById } = options;
   const eventHandlers = new Map<string, Array<(event: any) => Promise<void>>>();
   const stateStore = new Map<string, unknown>();
   const config = workerConfig();
@@ -327,7 +332,11 @@ function buildWorkerHost(options: { issuePrefix?: string | null; denyCompaniesGe
     agents: { list: vi.fn(async () => []), invoke: vi.fn() },
     issues: {
       list: vi.fn(async () => []),
-      get: vi.fn(async () => null),
+      get: vi.fn(async (issueId: string) => {
+        const record = issuesById?.[issueId];
+        if (record instanceof Error) throw record;
+        return record ?? null;
+      }),
       listComments: vi.fn(async () => []),
     },
     http: { fetch: discordFetch },
@@ -371,6 +380,116 @@ function postedButtonUrls(discordFetch: ReturnType<typeof vi.fn>): string[] {
     (row.components ?? []).map((c: any) => c.url).filter(Boolean),
   );
 }
+
+/** The whole last message the plugin posted to Discord. */
+function postedMessage(discordFetch: ReturnType<typeof vi.fn>): any {
+  const posts = discordFetch.mock.calls.filter(
+    (call: any[]) => typeof call[0] === "string" && call[0].includes("/channels/") && typeof call[1]?.body === "string",
+  );
+  const last = posts[posts.length - 1];
+  if (!last) throw new Error("Expected a Discord channel POST with a JSON body");
+  return JSON.parse(last[1].body);
+}
+
+function postedButtonLabels(discordFetch: ReturnType<typeof vi.fn>): string[] {
+  return (postedMessage(discordFetch).components ?? []).flatMap((row: any) =>
+    (row.components ?? []).map((c: any) => c.label).filter(Boolean),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// `View Parent` never rendered for any issue, at any nesting depth: the host
+// forwards `issue.created` straight from its activity log, whose details object
+// has no parent link at all. The button is gated on `payload.parentId`, so it
+// was always skipped — these cases pin the lookup that recovers it.
+// ---------------------------------------------------------------------------
+
+const HOST_CREATE_PAYLOAD = {
+  // Verbatim shape of what the host actually sends (see services/activity-log.ts):
+  // no parentId, plus scheduling bookkeeping.
+  title: "Child task",
+  identifier: "SOO-87",
+  status: "backlog",
+  statusDefaulted: false,
+  statusDefaultReason: "explicit",
+  assignmentWakeSkipped: true,
+  assignmentWakeSkipReason: "no_agent_assignee",
+};
+
+describe("issue.created recovers the parent link the host omits", () => {
+  beforeEach(() => {
+    _resetCompanyPrefixCache();
+  });
+
+  async function emitCreated(
+    issuesById: Record<string, Record<string, unknown> | Error>,
+    payload: Record<string, unknown> = HOST_CREATE_PAYLOAD,
+  ) {
+    const { ctx, eventHandlers, discordFetch } = buildWorkerHost({ issuesById });
+    await mountWorker(ctx);
+    await emit(eventHandlers, "issue.created", {
+      eventId: "evt-parent",
+      eventType: "issue.created",
+      occurredAt: new Date().toISOString(),
+      companyId: COMPANY_ID,
+      entityId: "child-1",
+      entityType: "issue",
+      payload,
+    });
+    return discordFetch;
+  }
+
+  it("renders View Parent, prefixed, from the looked-up parentId", async () => {
+    const discordFetch = await emitCreated({
+      "child-1": { id: "child-1", identifier: "SOO-87", parentId: "parent-1" },
+      "parent-1": { id: "parent-1", identifier: "SOO-84", title: "Deep link fix" },
+    });
+
+    expect(postedButtonLabels(discordFetch)).toContain("View Parent");
+    expect(postedButtonUrls(discordFetch)).toContain(`${API_BASE}/SOO/issues/parent-1`);
+  });
+
+  it("names the parent in the embed's Parent field", async () => {
+    const discordFetch = await emitCreated({
+      "child-1": { id: "child-1", identifier: "SOO-87", parentId: "parent-1" },
+      "parent-1": { id: "parent-1", identifier: "SOO-84", title: "Deep link fix" },
+    });
+
+    const parentField = postedMessage(discordFetch).embeds[0].fields.find(
+      (f: any) => f.name === "Parent",
+    );
+    expect(parentField?.value).toBe("**SOO-84** — Deep link fix");
+  });
+
+  it("keeps the button when the parent itself cannot be read", async () => {
+    const discordFetch = await emitCreated({
+      "child-1": { id: "child-1", identifier: "SOO-87", parentId: "parent-1" },
+      "parent-1": new Error("not allowed to perform \"issues.get\""),
+    });
+
+    // An unnamed parent still routes correctly, and the failed lookup must not
+    // cost the card its other enrichment.
+    expect(postedButtonUrls(discordFetch)).toContain(`${API_BASE}/SOO/issues/parent-1`);
+    expect(postedButtonUrls(discordFetch)).toContain(`${API_BASE}/SOO/issues/child-1`);
+  });
+
+  it("omits View Parent for a top-level issue", async () => {
+    const discordFetch = await emitCreated({
+      "child-1": { id: "child-1", identifier: "SOO-87", parentId: null },
+    });
+
+    expect(postedButtonLabels(discordFetch)).not.toContain("View Parent");
+  });
+
+  it("prefers a parent the event already carried over a lookup", async () => {
+    const discordFetch = await emitCreated(
+      { "child-1": { id: "child-1", parentId: "stale-parent" } },
+      { ...HOST_CREATE_PAYLOAD, parentId: "parent-from-event" },
+    );
+
+    expect(postedButtonUrls(discordFetch)).toContain(`${API_BASE}/SOO/issues/parent-from-event`);
+  });
+});
 
 describe("worker wiring: notifications carry prefixed deep links", () => {
   beforeEach(() => {

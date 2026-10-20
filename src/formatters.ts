@@ -70,6 +70,43 @@ function resolveBaseUrl(baseUrl?: string): string | null {
   }
 }
 
+/**
+ * Payload keys `formatIssueCreated` already renders into a named field, the
+ * embed body, or a button — never repeat them in the catch-all loop below.
+ */
+const RENDERED_ISSUE_PAYLOAD_KEYS = new Set([
+  "identifier", "title", "description", "status", "priority",
+  "assigneeName", "projectName", "assigneeAgentId", "projectId",
+  "creatorName", "parentIdentifier", "parentTitle", "parentId",
+]);
+
+/**
+ * Bookkeeping keys that must stay off the card.
+ *
+ * The catch-all loop exists to surface genuinely custom payload fields, but
+ * `issue.created` is forwarded verbatim from the host's activity log, so its
+ * payload also carries the host's own scheduling and audit bookkeeping plus
+ * whatever the worker's enrichment pass added. Rendering those turned every
+ * card into a wall of `statusDefaulted: false` / `assignmentWakeSkipReason`
+ * / raw `runId` fields that no reader wants.
+ *
+ * Unknown keys still render — only this named set is suppressed, so a host
+ * that starts sending something meaningful keeps showing it.
+ */
+const INTERNAL_ISSUE_PAYLOAD_KEYS = new Set([
+  // Host activity-log envelope (services/activity-log.ts).
+  "agentId", "runId", "responsibleUserId",
+  // Host issue-create bookkeeping (routes/issues.ts).
+  "statusDefaulted", "statusDefaultReason",
+  "assignmentWakeSkipped", "assignmentWakeSkipReason",
+  "addedReferencedIssues", "removedReferencedIssues", "currentReferencedIssues",
+  "referencedIssueIdentifiers", "blockedByIssueIds", "watchdogDiscovery",
+  "originKind", "originId", "billingCode",
+  // Added by the worker's own enrichment pass, for other formatters' use.
+  "assigneeUserId", "agentName", "executorName", "completedBy", "lastComment",
+  "completedAt", "updatedAt",
+]);
+
 export function formatIssueCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? p.title ?? event.entityId);
@@ -96,13 +133,10 @@ export function formatIssueCreated(event: PluginEvent, baseUrl?: string): Discor
   if (assigneeName) fields.push({ name: "Assignee", value: assigneeName, inline: true });
   if (projectName) fields.push({ name: "Project", value: projectName, inline: true });
 
-  const knownKeys = new Set([
-    "identifier", "title", "description", "status", "priority",
-    "assigneeName", "projectName", "assigneeAgentId", "projectId",
-    "creatorName", "parentIdentifier", "parentTitle", "parentId",
-  ]);
   for (const [key, value] of Object.entries(p)) {
-    if (knownKeys.has(key) || value == null || value === "") continue;
+    if (RENDERED_ISSUE_PAYLOAD_KEYS.has(key)) continue;
+    if (INTERNAL_ISSUE_PAYLOAD_KEYS.has(key)) continue;
+    if (value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
     if (display.length > 0 && display.length <= 1024) {
       fields.push({ name: key, value: display, inline: display.length < 40 });
@@ -218,6 +252,61 @@ function humanizeActorLabel(value: string | null): string | null {
   return trimmed;
 }
 
+const APPROVAL_TYPE_LABELS: Record<string, string> = {
+  hire_agent: "Hire Agent",
+  approve_ceo_strategy: "CEO Strategy",
+  budget_override_required: "Budget Override",
+  request_board_approval: "Board Approval",
+};
+
+export function humanizeApprovalType(raw: string): string {
+  return APPROVAL_TYPE_LABELS[raw] ?? raw;
+}
+
+/**
+ * Payload keys `formatApprovalCreated` already renders into a named field, the
+ * embed body, or a button — never repeat them in the catch-all loop below.
+ */
+const RENDERED_APPROVAL_PAYLOAD_KEYS = new Set([
+  "type", "approvalId", "title", "description", "agentName",
+  "issueIds", "linkedIssues",
+]);
+
+/**
+ * Bookkeeping keys that must stay off the card.
+ *
+ * `approval.created` is the host's activity-log entry, so its payload is the
+ * log envelope — `agentId` / `runId` / `responsibleUserId` — wrapped around a
+ * bare `{ type, issueIds }`. Rendering those produced the card the board
+ * complained about: an untitled "Approval Requested" showing a raw
+ * `request_board_approval`, a UUID under "Linked Issues", and a
+ * `responsibleUserId` UUID — none of which say what is being approved.
+ *
+ * The approval's real payload (what the requester wrote) is merged in by the
+ * worker's enrichment pass. Unknown keys from there still render — only this
+ * named set is suppressed, so anything an agent attaches keeps showing.
+ */
+const INTERNAL_APPROVAL_PAYLOAD_KEYS = new Set([
+  // Host activity-log envelope (services/activity-log.ts).
+  "agentId", "runId", "responsibleUserId", "actorId", "actorType",
+  // Approval row columns the card expresses through its own chrome.
+  "id", "companyId", "status", "requestedByAgentId", "requestedByUserId",
+  "decisionNote", "decidedByUserId", "decidedAt", "createdAt", "updatedAt",
+]);
+
+function formatLinkedIssueLine(issue: Record<string, unknown>): string {
+  const identifier = issue.identifier ? String(issue.identifier) : null;
+  const title = issue.title ? String(issue.title) : "";
+  const parts = [identifier ? `**${identifier}** ${title}` : `**${title || "?"}**`];
+  const meta: string[] = [];
+  if (issue.status) meta.push(humanizeStatus(String(issue.status)));
+  if (issue.priority) meta.push(humanizePriority(String(issue.priority)));
+  if (issue.assignee) meta.push(`→ ${issue.assignee}`);
+  if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
+  if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
+  return parts.join(" ");
+}
+
 export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): DiscordMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
@@ -225,79 +314,81 @@ export function formatApprovalCreated(event: PluginEvent, baseUrl?: string): Dis
   const title = String(p.title ?? "");
   const description = String(p.description ?? "");
   const agentName = String(p.agentName ?? "");
-  const issueIds = Array.isArray(p.issueIds) ? p.issueIds as string[] : [];
   const dashboardBase = resolveBaseUrl(baseUrl);
 
   const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
-  if (agentName) fields.push({ name: "Agent", value: agentName, inline: true });
-  fields.push({ name: "Type", value: `\`${approvalType}\``, inline: true });
-  if (issueIds.length > 0) {
-    fields.push({ name: "Linked Issues", value: issueIds.join(", ") });
-  }
+  if (agentName) fields.push({ name: "Requested by", value: agentName, inline: true });
+  fields.push({ name: "Type", value: `\`${humanizeApprovalType(approvalType)}\``, inline: true });
 
+  // Raw `issueIds` are deliberately not rendered: unenriched they are UUIDs,
+  // and a UUID tells the approver nothing. The worker resolves them into
+  // `linkedIssues` with identifiers and titles; that is what belongs here.
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Record<string, unknown>> : [];
   if (linkedIssues.length > 0) {
-    const issueLines = linkedIssues.map((issue) => {
-      const parts = [`**${issue.identifier ?? "?"}** ${issue.title ?? ""}`];
-      const meta: string[] = [];
-      if (issue.status) meta.push(String(issue.status));
-      if (issue.priority) meta.push(String(issue.priority));
-      if (issue.assignee) meta.push(`→ ${issue.assignee}`);
-      if (meta.length > 0) parts.push(`(${meta.join(" | ")})`);
-      if (issue.description) parts.push(`\n> ${String(issue.description).slice(0, 100)}`);
-      return parts.join(" ");
-    });
-    fields.push({ name: `Linked Issues (${linkedIssues.length})`, value: issueLines.join("\n\n").slice(0, 1024) });
+    const issueLines = linkedIssues.map(formatLinkedIssueLine);
+    const name = linkedIssues.length > 1 ? `Linked Issues (${linkedIssues.length})` : "Linked Issue";
+    fields.push({ name, value: issueLines.join("\n\n").slice(0, 1024) });
   }
 
-  const knownKeys = new Set(["type", "approvalId", "title", "description", "agentName", "issueIds", "agentId", "runId", "linkedIssues"]);
   for (const [key, value] of Object.entries(p)) {
-    if (knownKeys.has(key) || value == null || value === "") continue;
+    if (RENDERED_APPROVAL_PAYLOAD_KEYS.has(key)) continue;
+    if (INTERNAL_APPROVAL_PAYLOAD_KEYS.has(key)) continue;
+    if (value == null || value === "") continue;
     const display = typeof value === "object" ? JSON.stringify(value) : String(value);
     if (display.length > 0 && display.length <= 1024) {
       fields.push({ name: key, value: display, inline: display.length < 40 });
     }
   }
 
+  const buttons: DiscordComponent[] = [
+    {
+      type: 2,
+      style: 3,
+      label: "Approve",
+      custom_id: `approval_approve_${approvalId}`,
+    },
+    {
+      type: 2,
+      style: 4,
+      label: "Reject",
+      custom_id: `approval_reject_${approvalId}`,
+    },
+  ];
+  if (dashboardBase) {
+    buttons.push({
+      type: 2,
+      style: 5,
+      label: "View",
+      url: `${dashboardBase}/approvals/${approvalId}`,
+    });
+  }
+  // One linked issue is the common case (an agent asking the board to sign off
+  // on a task); send the approver straight there instead of making them hunt.
+  const soleIssueId = linkedIssues.length === 1 && linkedIssues[0]?.id ? String(linkedIssues[0].id) : null;
+  if (dashboardBase && soleIssueId) {
+    const label = linkedIssues[0]?.identifier
+      ? `View ${String(linkedIssues[0].identifier)}`
+      : "View Issue";
+    buttons.push({ type: 2, style: 5, label, url: `${dashboardBase}/issues/${soleIssueId}` });
+  }
+
   return {
     embeds: [
       {
-        title: title ? `Approval: ${title}` : "Approval Requested",
-        description: description || undefined,
+        title: title ? `Approval: ${title}`.slice(0, 256) : "Approval Requested",
+        description: description ? truncate(description, 2000) : undefined,
         color: COLORS.YELLOW,
         fields,
         footer: { text: "Paperclip" },
         timestamp: event.occurredAt,
       },
     ],
-    components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 2,
-            style: 3,
-            label: "Approve",
-            custom_id: `approval_approve_${approvalId}`,
-          },
-          {
-            type: 2,
-            style: 4,
-            label: "Reject",
-            custom_id: `approval_reject_${approvalId}`,
-          },
-          ...(dashboardBase
-            ? [{
-                type: 2,
-                style: 5,
-                label: "View",
-                url: `${dashboardBase}/approvals/${approvalId}`,
-              } satisfies DiscordComponent]
-            : []),
-        ],
-      },
-    ],
+    components: [{ type: 1, components: buttons }],
   };
+}
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 export function formatAgentError(event: PluginEvent): DiscordMessage {
